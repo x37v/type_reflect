@@ -21,13 +21,54 @@ impl ToTokens for ExprSubstitution {
     }
 }
 
+struct RepetitionSubstitution {
+    name: String,
+    iter_var: Ident,
+    inner_format: String,
+    inner_subs: Vec<ExprSubstitution>,
+    separator: String,
+}
+
+impl ToTokens for RepetitionSubstitution {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let name = Ident::new(self.name.as_str(), Span::call_site());
+        let iter_var = &self.iter_var;
+        let inner_format = &self.inner_format;
+        let separator = &self.separator;
+        let inner_subs = &self.inner_subs;
+        tokens.extend(quote! {
+            #name = {
+                let mut __result = ::std::vec::Vec::<::std::string::String>::new();
+                for #iter_var in #iter_var.into_iter() {
+                    __result.push(format!(#inner_format, #(#inner_subs,)*));
+                }
+                __result.join(#separator)
+            }
+        })
+    }
+}
+
+enum Substitution {
+    Expr(ExprSubstitution),
+    Repetition(RepetitionSubstitution),
+}
+
+impl ToTokens for Substitution {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            Substitution::Expr(e) => e.to_tokens(tokens),
+            Substitution::Repetition(r) => r.to_tokens(tokens),
+        }
+    }
+}
+
 pub struct ParseContext {
     id: String,
     subgroup_index: u32,
     token_iter: Peekable<token_stream::IntoIter>,
     string_val: String,
     ident_substituions: HashSet<Ident>,
-    expr_substituions: Vec<ExprSubstitution>,
+    expr_substituions: Vec<Substitution>,
 }
 
 impl ParseContext {
@@ -63,10 +104,10 @@ impl ParseContext {
 
     fn create_expr_substitution(&mut self, expr: TokenStream) -> String {
         let name = format!("_expr_sub_{}_{}", self.id, self.expr_substituions.len());
-        self.expr_substituions.push(ExprSubstitution {
+        self.expr_substituions.push(Substitution::Expr(ExprSubstitution {
             name: name.clone(),
             expr,
-        });
+        }));
         name
     }
 
@@ -174,6 +215,17 @@ impl ParseContext {
         };
         let token = token.clone();
         match token {
+            // ## escape: emit a literal '#' followed by any immediately-following ident
+            TokenTree::Punct(ref p) if p.as_char() == '#' => {
+                let _ = self.next(); // consume the second '#'
+                let mut literal = "#".to_string();
+                if let Some(TokenTree::Ident(ident)) = self.peek_next().cloned() {
+                    let _ = self.next();
+                    literal.push_str(&ident.to_string());
+                }
+                // Push as a static fragment — no trailing space, handled by caller's push_back_str
+                self.push_back_str(&literal);
+            }
             TokenTree::Group(group) => {
                 let _ = self.next();
                 self.consume_group_hash_substitution(group)
@@ -188,7 +240,104 @@ impl ParseContext {
     }
 
     fn consume_group_hash_substitution(&mut self, group: Group) {
-        let name = self.create_expr_substitution(group.stream());
+        // Only paren groups can be repetition; brace/bracket fall through to expr substitution
+        if group.delimiter() != Delimiter::Parenthesis {
+            let name = self.create_expr_substitution(group.stream());
+            self.push_back_str(format!("{{{}}}", name).as_str());
+            return;
+        }
+
+        // Peek ahead to decide: repetition or plain expr substitution
+        let separator: Option<String> = match self.peek_next().cloned() {
+            Some(TokenTree::Punct(ref p)) if p.as_char() == '*' => {
+                let _ = self.next(); // consume '*'
+                Some(String::new())
+            }
+            Some(TokenTree::Punct(ref p)) if p.as_char() != '*' => {
+                let sep_char = p.as_char();
+                let _ = self.next(); // consume separator punct
+                // Expect '*' next
+                match self.peek_next() {
+                    Some(TokenTree::Punct(ref star)) if star.as_char() == '*' => {
+                        let _ = self.next(); // consume '*'
+                        Some(sep_char.to_string())
+                    }
+                    _ => {
+                        // Not a repetition — treat as plain expr substitution
+                        None
+                    }
+                }
+            }
+            Some(TokenTree::Literal(ref lit)) => {
+                let lit_str = lit.to_string();
+                // Check if it looks like a string literal (starts with '"')
+                if lit_str.starts_with('"') {
+                    let lit_clone = lit.clone();
+                    let _ = self.next(); // consume the literal
+                    // Expect '*' next
+                    match self.peek_next() {
+                        Some(TokenTree::Punct(ref star)) if star.as_char() == '*' => {
+                            let _ = self.next(); // consume '*'
+                            // Parse the string literal value
+                            if let Ok(Lit::Str(s)) = parse_str::<Lit>(&lit_clone.to_string()) {
+                                Some(s.value())
+                            } else {
+                                Some(lit_clone.to_string())
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        match separator {
+            Some(sep) => self.consume_repetition(group, sep),
+            None => {
+                let name = self.create_expr_substitution(group.stream());
+                self.push_back_str(format!("{{{}}}", name).as_str());
+            }
+        }
+    }
+
+    fn consume_repetition(&mut self, group: Group, separator: String) {
+        // Parse the inner body of the repetition group into its own sub-context
+        let sub_id = format!("{}{}", self.id, self.subgroup_index);
+        self.subgroup_index += 1;
+
+        let mut sub = ParseContext::new(sub_id.clone(), group.stream());
+        sub.parse();
+
+        // The iterator variable is the first ident substitution found in the body
+        let iter_var = sub
+            .ident_substituions
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| Ident::new("__item", Span::call_site()));
+
+        // Build the inner format string and inner expr substitutions
+        let inner_format = sub.string_val.trim().to_string();
+        let inner_subs: Vec<ExprSubstitution> = sub
+            .expr_substituions
+            .into_iter()
+            .filter_map(|s| match s {
+                Substitution::Expr(e) => Some(e),
+                Substitution::Repetition(_) => None,
+            })
+            .collect();
+
+        let name = format!("_expr_sub_{}_{}", self.id, self.expr_substituions.len());
+        self.expr_substituions.push(Substitution::Repetition(RepetitionSubstitution {
+            name: name.clone(),
+            iter_var,
+            inner_format,
+            inner_subs,
+            separator,
+        }));
         self.push_back_str(format!("{{{}}}", name).as_str());
     }
 

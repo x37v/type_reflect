@@ -84,9 +84,11 @@ impl TSSource for TS {
     }
 }
 
-#[cfg(all(test, feature = "deno_ast"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "deno_ast")]
     #[test]
     fn test_format_source_from_string() -> anyhow::Result<()> {
         let ts: TS = TS::from_source("let a = 1; let b = 2;".to_string())?;
@@ -99,5 +101,54 @@ mod tests {
         assert_eq!(output.as_str(), "let a = 1;\nlet b = 2;\n");
 
         Ok(())
+    }
+
+    #[test]
+    fn test_repetition_no_separator() {
+        let items = vec!["A", "B", "C"];
+        let s = ts_string! { type T = #(#items)* };
+        assert_eq!(s.trim(), "type T = ABC");
+    }
+
+    #[test]
+    fn test_repetition_punct_separator() {
+        let items = vec!["A", "B", "C"];
+        let s = ts_string! { type T = #(#items) | * };
+        assert_eq!(s.trim(), "type T = A|B|C");
+    }
+
+    #[test]
+    fn test_repetition_string_literal_separator() {
+        let items = vec!["x: number", "y: number"];
+        let s = ts_string! { type P = { #(#items)"\n"* } };
+        assert!(s.contains("x: number\ny: number"));
+    }
+
+    #[test]
+    fn test_repetition_empty_iterator() {
+        let items: Vec<&str> = vec![];
+        let s = ts_string! { type T = #(#items),* };
+        assert!(!s.contains(','));
+    }
+
+    #[test]
+    fn test_repetition_comma_separator() {
+        let items = vec!["a", "b", "c"];
+        let s = ts_string! { const arr = [#(#items),*] };
+        assert!(s.contains("a,b,c"));
+    }
+
+    #[test]
+    fn test_literal_hash_escape() {
+        let s = ts_string! { class User { ##name: string; } };
+        assert!(s.contains("#name"));
+        // Ensure there is no double-# in the output
+        assert!(!s.contains("##"));
+    }
+
+    #[test]
+    fn test_literal_hash_escape_standalone() {
+        let s = ts_string! { ##field };
+        assert!(s.contains("#field"));
     }
 }
