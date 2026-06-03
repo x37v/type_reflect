@@ -151,4 +151,170 @@ mod tests {
         let s = ts_string! { ##field };
         assert!(s.contains("#field"));
     }
+
+    #[test]
+    fn test_outer_doc_line_comment() {
+        let s = ts_string! {
+            /// hi
+            const a = 1;
+        };
+        assert!(s.contains("// hi"));
+        // comment and code are on separate lines
+        let comment_line = s.lines().find(|l| l.contains("// hi")).unwrap();
+        assert!(!comment_line.contains("const a"));
+    }
+
+    #[test]
+    fn test_doc_strips_single_leading_space() {
+        let s = ts_string! {
+            /// hi
+            const a = 1;
+        };
+        assert!(s.contains("// hi"));
+        assert!(!s.contains("//  hi"));
+    }
+
+    #[test]
+    fn test_inner_doc_comment() {
+        let s = ts_string! {
+            //! mod
+            const a = 1;
+        };
+        assert!(s.contains("// mod"));
+    }
+
+    #[test]
+    fn test_block_doc_renders_line_comments() {
+        let s = ts_string! {
+            /** a
+             * b */
+            const a = 1;
+        };
+        assert!(s.contains("// a"));
+        assert!(s.contains("// b"));
+        assert!(!s.contains("/**"));
+    }
+
+    #[test]
+    fn test_jsdoc_marker_single_line() {
+        let s = ts_string! {
+            ///doc a 2D point
+            const a = 1;
+        };
+        assert!(s.contains("/**"));
+        assert!(s.contains(" * a 2D point"));
+        assert!(s.contains(" */"));
+    }
+
+    #[test]
+    fn test_jsdoc_marker_multiline() {
+        let s = ts_string! {
+            /**doc a
+             * b */
+            const a = 1;
+        };
+        assert!(s.contains("/**"));
+        assert!(s.contains(" * a"));
+        assert!(s.contains(" * b"));
+    }
+
+    #[test]
+    fn test_jsdoc_marker_inner() {
+        let s = ts_string! {
+            //!doc note
+            const a = 1;
+        };
+        assert!(s.contains("/**"));
+        assert!(s.contains(" * note"));
+    }
+
+    #[test]
+    fn test_marker_requires_word_boundary() {
+        let s = ts_string! {
+            ///document foo
+            const a = 1;
+        };
+        assert!(s.contains("// document foo") || s.contains("//document foo"));
+        assert!(!s.contains("/**"));
+    }
+
+    #[test]
+    fn test_normal_doc_with_doc_word() {
+        let s = ts_string! {
+            /// doc this
+            const a = 1;
+        };
+        assert!(s.contains("// doc this"));
+        assert!(!s.contains("/**"));
+    }
+
+    #[test]
+    fn test_doc_does_not_comment_out_code() {
+        let s = ts_string! {
+            /// note
+            const a = 1;
+        };
+        let comment_line = s.lines().find(|l| l.contains("// note")).unwrap();
+        assert!(!comment_line.contains("const a = 1;"));
+    }
+
+    #[test]
+    fn test_doc_brace_escaping() {
+        let s = ts_string! {
+            /// returns {ok}
+            const a = 1;
+        };
+        assert!(s.contains("// returns {ok}"));
+    }
+
+    #[test]
+    fn test_multiple_consecutive_line_docs() {
+        let s = ts_string! {
+            /// one
+            /// two
+            const a = 1;
+        };
+        assert!(s.contains("// one"));
+        assert!(s.contains("// two"));
+        let one_line = s.lines().find(|l| l.contains("// one")).unwrap();
+        assert!(!one_line.contains("// two"));
+    }
+
+    #[test]
+    fn test_doc_inside_brace_group() {
+        let s = ts_string! {
+            type T = {
+                /// x
+                x: number;
+            };
+        };
+        assert!(s.contains("// x"));
+        assert!(s.contains("number"));
+        // the comment is on its own line, not merged with the field
+        let comment_line = s.lines().find(|l| l.contains("// x")).unwrap();
+        assert!(!comment_line.contains("number"));
+    }
+
+    #[test]
+    fn test_jsdoc_neutralizes_inner_terminator() {
+        // A literal `*/` can only reach the doc text via line-doc syntax — a
+        // `/** */` block would itself terminate at the first `*/` in source.
+        let s = ts_string! {
+            ///doc ends with */ here
+            const a = 1;
+        };
+        // The `*/` inside the JSDoc body must be neutralized so the block
+        // doesn't terminate early. Exactly one real terminator remains.
+        assert!(s.contains("/**"));
+        assert_eq!(s.matches("*/").count(), 1);
+    }
+
+    #[test]
+    fn test_non_doc_attr_still_expr_substitution() {
+        // A non-doc bracket group in the hash path should still be treated as an
+        // expr substitution (the bracketed tokens evaluate as a Rust expression).
+        let v = 7;
+        let s = ts_string! { const a = #[v]; };
+        assert!(s.contains("7"));
+    }
 }

@@ -24,4 +24,21 @@ fn main() {
     // Literal # escape for TypeScript private fields
     let s = ts_string! { class User { ##name: string; } };
     println!("{s}");
+
+    // Doc comments are preserved (use `///` / `//!` / `/** */`, not `//` —
+    // plain `//` and `/* */` comments are stripped by the compiler before the
+    // macro ever sees them).
+    // Default -> TS line comment. Prefix the text with `doc` -> TS JSDoc block.
+    let s = ts_string! {
+        //should not see this one
+        ///doc A 2D point
+        type Point = {
+            /// the horizontal coordinate
+            x: number;
+            /**doc vertical
+             * coordinate */
+            y: number;
+        };
+    };
+    println!("{s}");
 }

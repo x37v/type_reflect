@@ -226,6 +226,19 @@ impl ParseContext {
                 // Push as a static fragment — no trailing space, handled by caller's push_back_str
                 self.push_back_str(&literal);
             }
+            // #![doc = "..."] inner doc comment (//! or /*! */)
+            TokenTree::Punct(ref p) if p.as_char() == '!' => {
+                let _ = self.next(); // consume '!'
+                if let Some(TokenTree::Group(g)) = self.peek_next().cloned() {
+                    if let Some(text) = Self::parse_doc_group(&g) {
+                        let _ = self.next(); // consume the group
+                        self.push_back_comment(&text);
+                        return;
+                    }
+                }
+                self.push_back_str("#");
+                self.consume_punct_series(Punct::new('!', Spacing::Alone));
+            }
             TokenTree::Group(group) => {
                 let _ = self.next();
                 self.consume_group_hash_substitution(group)
@@ -242,6 +255,11 @@ impl ParseContext {
     fn consume_group_hash_substitution(&mut self, group: Group) {
         // Only paren groups can be repetition; brace/bracket fall through to expr substitution
         if group.delimiter() != Delimiter::Parenthesis {
+            // #[doc = "..."] outer doc comment (/// or /** */)
+            if let Some(text) = Self::parse_doc_group(&group) {
+                self.push_back_comment(&text);
+                return;
+            }
             let name = self.create_expr_substitution(group.stream());
             self.push_back_str(format!("{{{}}}", name).as_str());
             return;
@@ -379,6 +397,83 @@ impl ParseContext {
         self.push_back_str(lit.as_str());
     }
 
+    /// If `group` is `[ doc = "..." ]`, return the decoded literal value
+    /// (still including the lexer's leading space). Returns None for any other
+    /// attribute shape (e.g. `#[derive(..)]`, `#[doc(hidden)]`) so those fall
+    /// through to the existing expr-substitution behavior.
+    fn parse_doc_group(group: &Group) -> Option<String> {
+        if group.delimiter() != Delimiter::Bracket {
+            return None;
+        }
+        let mut it = group.stream().into_iter();
+        match it.next() {
+            Some(TokenTree::Ident(id)) if id == "doc" => {}
+            _ => return None,
+        }
+        match it.next() {
+            Some(TokenTree::Punct(p)) if p.as_char() == '=' => {}
+            _ => return None,
+        }
+        let lit = match it.next() {
+            Some(TokenTree::Literal(l)) => l,
+            _ => return None,
+        };
+        if it.next().is_some() {
+            return None; // exactly 3 tokens
+        }
+        match parse_str::<Lit>(&lit.to_string()) {
+            Ok(Lit::Str(s)) => Some(s.value()),
+            _ => None,
+        }
+    }
+
+    /// Trim trailing spaces from `string_val`; if the result is non-empty and
+    /// doesn't end in `\n`, append one. Guarantees a comment starts on its own
+    /// line (`consume_next` appends a trailing space after every token).
+    fn ensure_newline(&mut self) {
+        while self.string_val.ends_with(' ') {
+            self.string_val.pop();
+        }
+        if !self.string_val.is_empty() && !self.string_val.ends_with('\n') {
+            self.string_val.push('\n');
+        }
+    }
+
+    /// Emit a TypeScript comment from decoded doc text. Default is `//` line
+    /// comment(s); a leading `doc` marker selects a JSDoc block. Always starts
+    /// and ends on its own line so following code is never commented out.
+    fn push_back_comment(&mut self, raw: &str) {
+        self.ensure_newline();
+        match strip_jsdoc_marker(raw) {
+            Some(content) => self.push_back_jsdoc(content),
+            None => self.push_back_line_comment(raw),
+        }
+        self.string_val.push('\n');
+    }
+
+    fn push_back_line_comment(&mut self, raw: &str) {
+        for (i, line) in raw.split('\n').enumerate() {
+            if i > 0 {
+                self.string_val.push('\n');
+            }
+            self.string_val.push_str("// ");
+            self.string_val.push_str(&escape_braces(clean_doc_line(line)));
+        }
+    }
+
+    fn push_back_jsdoc(&mut self, raw: &str) {
+        self.string_val.push_str("/**\n");
+        for line in raw.split('\n') {
+            let l = escape_terminator(&escape_braces(clean_doc_line(line)));
+            if l.is_empty() {
+                self.string_val.push_str(" *\n");
+            } else {
+                self.string_val.push_str(&format!(" * {}\n", l));
+            }
+        }
+        self.string_val.push_str(" */");
+    }
+
     fn consume_hashed_literal_component(&mut self, lit: String) {
         // If there are no characters in the literal string, we just
         // push back the # character
@@ -506,6 +601,42 @@ fn split_at_index(s: &str, index: usize) -> Option<(&str, &str)> {
 
     let (first_part, second_part) = s.split_at(index);
     Some((first_part, second_part))
+}
+
+/// `Some(content)` when text opts into JSDoc via a leading `doc` marker at a
+/// word boundary (`///doc`, `//!doc`, `/**doc ... */`); marker removed.
+/// A normal `/// doc ...` has a leading space, so `strip_prefix("doc")` leaves
+/// text " doc ..." and this returns None (it stays a line comment).
+fn strip_jsdoc_marker(raw: &str) -> Option<&str> {
+    let rest = raw.strip_prefix("doc")?;
+    match rest.chars().next() {
+        None => Some(rest),                         // exactly "doc"
+        Some(c) if c.is_whitespace() => Some(rest), // "doc ...", "doc\n..."
+        _ => None,                                  // e.g. "document" -> line comment
+    }
+}
+
+/// Strip the single leading space the lexer adds, then any further indentation
+/// and an optional JSDoc-style `* ` / `*` continuation prefix (common in
+/// `/** ... */` blocks), and trim trailing whitespace.
+fn clean_doc_line(line: &str) -> &str {
+    let line = line.strip_prefix(' ').unwrap_or(line);
+    let line = line.trim_start();
+    let line = line
+        .strip_prefix("* ")
+        .or_else(|| line.strip_prefix('*'))
+        .unwrap_or(line);
+    line.trim_end()
+}
+
+/// Escape `{`/`}` so `format!` doesn't treat comment text as placeholders.
+fn escape_braces(s: &str) -> String {
+    s.replace('{', "{{").replace('}', "}}")
+}
+
+/// Replace any `*/` in JSDoc text with `* /` so the block can't terminate early.
+fn escape_terminator(s: &str) -> String {
+    s.replace("*/", "* /")
 }
 
 fn is_ident_character(c: char) -> bool {
