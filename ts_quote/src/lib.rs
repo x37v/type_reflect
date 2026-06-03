@@ -1,16 +1,21 @@
+pub use ts_quote_macros::ts_quote;
+pub use ts_quote_macros::ts_string;
+
+#[cfg(feature = "deno_ast")]
 use deno_ast::{parse_module, Diagnostic, SourceTextInfo};
+#[cfg(feature = "deno_ast")]
 use dprint_plugin_typescript::{
     configuration::{Configuration, ConfigurationBuilder, NextControlFlowPosition, QuoteStyle},
     format_parsed_source,
 };
-pub use ts_quote_macros::ts_quote;
-pub use ts_quote_macros::ts_string;
 
+#[cfg(feature = "deno_ast")]
 pub use deno_ast::ParsedSource as TS;
 
 /**
 The TSSource trait is used to add a few convenience methods to the  deno_ast::ParsedSource type.
 **/
+#[cfg(feature = "deno_ast")]
 pub trait TSSource: Sized {
     /**
     Creates a ParsedSource instance from a string.
@@ -47,6 +52,7 @@ pub trait TSSource: Sized {
     fn formatted(&self, config: Option<&Configuration>) -> anyhow::Result<String>;
 }
 
+#[cfg(feature = "deno_ast")]
 impl TSSource for TS {
     fn from_source(source: String) -> Result<Self, Diagnostic> {
         parse_module(deno_ast::ParseParams {
@@ -78,7 +84,7 @@ impl TSSource for TS {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "deno_ast"))]
 mod tests {
     use super::*;
     #[test]
